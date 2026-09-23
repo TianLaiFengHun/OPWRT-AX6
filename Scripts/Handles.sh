@@ -24,6 +24,24 @@ if [ -f "$NSS_PBUF" ]; then
 	cd $PKG_PATH && echo "qca-nss-pbuf has been fixed!"
 fi
 
+#修复TailScale配置文件冲突
+#按 asvow/luci-app-tailscale 官方要求：
+#删除 openwrt/packages 自带 tailscale Makefile 中安装
+#  $(INSTALL_BIN) ./files//tailscale.init $(1)/etc/init.d/tailscale
+#  $(INSTALL_DATA) ./files//tailscale.conf $(1)/etc/config/tailscale
+#这两行，由 luci-app-tailscale 统一提供 /etc/init.d/tailscale 与
+#/etc/config/tailscale，避免 package/install 阶段文件归属冲突
+#(ERROR: trying to overwrite ... owned by tailscale-xxx)。
+#注意：不能再用 sed -i '/\/files/d'（会误删其它含 /files 的行）。
+TS_FILE=$(find ../feeds/packages/ -maxdepth 3 -type f -wholename "*/tailscale/Makefile")
+if [ -f "$TS_FILE" ]; then
+	echo " "
+
+	sed -i '/\/etc\/init\.d\/tailscale/d;/\/etc\/config\/tailscale/d' $TS_FILE
+
+	cd $PKG_PATH && echo "tailscale has been fixed!"
+fi
+
 #修复Rust编译失败
 RUST_FILE=$(find ../feeds/packages/ -maxdepth 3 -type f -wholename "*/rust/Makefile")
 if [ -f "$RUST_FILE" ]; then
