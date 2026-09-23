@@ -1,0 +1,17 @@
+config limit 'global'
+	option enabled '1'
+
+# ECM/NSS 硬件加速自动跳过（限速设备自动卸载 offload）
+config ecm_exclude 'global'
+	option enabled '1'
+	# 打给限速设备流量的 fwmark / ctmark 值（ECM mark classifier 识别后拒绝硬件加速）
+	option mark '0x10'
+	# 参与比较的掩码，默认与 mark 相同（仅比对 mark 位）
+	option mark_mask '0x10'
+
+config device
+	option name 'example'
+	option mac 'aa:bb:cc:dd:ee:ff'
+	option ip '192.168.1.100'
+	option limit '256'
+	option enabled '1'

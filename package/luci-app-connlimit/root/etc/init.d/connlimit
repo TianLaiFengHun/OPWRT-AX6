@@ -1,0 +1,257 @@
+#!/bin/sh /etc/rc.common
+# Connection Limit - per-device nftables connlimit (IPv4 / IPv6 / MAC)
+# 内置 ECM/NSS 硬件加速自动跳过：为所有限速设备（connlimit + eqosplus）
+# 生成 fwmark/ctmark 规则并启用 ECM mark classifier，保证限速真实生效。
+START=98
+STOP=10
+
+NFT_FILE="/etc/nftables.d/50-connlimit.nft"
+ECM_NFT_FILE="/etc/nftables.d/50-ecm-auto-exclude.nft"
+MARK="0x10"
+MARK_MASK="0x10"
+
+start() {
+	enable_mark_classifier
+	generate_nft
+	generate_ecm_exclude
+	reload_fw4
+}
+
+stop() {
+	rm -f "$NFT_FILE" "$ECM_NFT_FILE"
+	reload_fw4
+}
+
+restart() {
+	start
+}
+
+reload() {
+	start
+}
+
+generate_nft() {
+	. /lib/functions.sh
+
+	rm -f "$NFT_FILE"
+
+	config_load connlimit
+
+	local enabled=0
+	config_get_bool enabled global enabled 0
+	[ "$enabled" = "1" ] || return 0
+
+	cat > "$NFT_FILE" << 'EOF'
+table inet connlimit {
+	set mac_limit {
+		type ether_addr
+		flags dynamic
+		size 65536
+	}
+	set ip_limit {
+		type ipv4_addr
+		flags dynamic
+		size 65536
+	}
+	set ip6_limit {
+		type ipv6_addr
+		flags dynamic
+		size 65536
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+EOF
+
+	config_foreach device_rule device
+
+	echo "	}" >> "$NFT_FILE"
+	echo "}" >> "$NFT_FILE"
+}
+
+device_rule() {
+	local name ip ip6 mac limit dev_enabled
+	config_get name "$1" name
+	config_get ip "$1" ip
+	config_get ip6 "$1" ip6
+	config_get mac "$1" mac
+	config_get limit "$1" limit
+	config_get_bool dev_enabled "$1" enabled 1
+
+	[ "$dev_enabled" = "1" ] || return 0
+	[ "$limit" -gt 0 ] 2>/dev/null || return 0
+
+	# 优先级：MAC > IPv6 > IPv4（MAC 一条规则同时覆盖 v4/v6 流量）
+	if [ -n "$mac" ]; then
+		echo "		ether saddr $mac ct count $limit add @mac_limit drop" >> "$NFT_FILE"
+	elif [ -n "$ip6" ]; then
+		echo "		ip6 saddr $ip6 ct count $limit add @ip6_limit drop" >> "$NFT_FILE"
+	elif [ -n "$ip" ]; then
+		echo "		ip saddr $ip ct count $limit add @ip_limit drop" >> "$NFT_FILE"
+	fi
+}
+
+reload_fw4() {
+	/etc/init.d/fw4 reload 2>/dev/null || /etc/init.d/firewall restart 2>/dev/null
+}
+
+# ---------- ECM/NSS 硬件加速自动跳过 ----------
+
+# 启用 ECM mark classifier（幂等，与 99-marvis-tune first-boot 兜底互补）：
+#   真实路径以 qca-nss-ecm.init 实际操作为准，ECM 模块加载后才存在；
+#   本脚本 START=98 晚于 ECM 加载，可直接探测写入。失败只提示、不阻断。
+enable_mark_classifier() {
+	local cur
+	ECM_CLASSIFIER_ENABLED=""
+	if [ -f "/sys/kernel/debug/ecm/ecm_classifier_mark/enabled" ]; then
+		ECM_CLASSIFIER_ENABLED="/sys/kernel/debug/ecm/ecm_classifier_mark/enabled"
+	elif [ -f "/proc/sys/net/ecm/ecm_classifier_mark_enable" ]; then
+		ECM_CLASSIFIER_ENABLED="/proc/sys/net/ecm/ecm_classifier_mark_enable"
+	fi
+
+	if [ -n "$ECM_CLASSIFIER_ENABLED" ]; then
+		cur=$(cat "$ECM_CLASSIFIER_ENABLED" 2>/dev/null)
+		[ "$cur" = "1" ] || echo 1 > "$ECM_CLASSIFIER_ENABLED" 2>/dev/null
+	else
+		echo "connlimit(ecm-exclude): ECM mark classifier interface not found; rules kept but hw-offload skip may not take effect" >&2
+	fi
+}
+
+# 探测 ECM 接口；失败只提示、不阻断（规则照常保留）
+probe_ecm_classifier() {
+	ECM_IFACE=""
+	if [ -d "/sys/kernel/debug/ecm" ]; then
+		ECM_IFACE="/sys/kernel/debug/ecm"
+	elif [ -d "/proc/sys/net/ecm" ]; then
+		ECM_IFACE="/proc/sys/net/ecm"
+	fi
+
+	if [ -z "$ECM_IFACE" ]; then
+		echo "connlimit(ecm-exclude): ECM interface not found under /sys/kernel/debug/ecm/ or /proc/sys/net/ecm/; rules kept but hw-offload skip may not take effect on this firmware" >&2
+	fi
+}
+
+# 为限速设备生成 fwmark/ctmark 跳过规则（/etc/config/connlimit 的 ecm_exclude 段）
+generate_ecm_exclude() {
+	local enabled=1
+
+	config_load connlimit
+	config_get_bool enabled ecm_exclude enabled 1
+	[ "$enabled" = "1" ] || {
+		rm -f "$ECM_NFT_FILE"
+		return 0
+	}
+
+	config_get MARK ecm_exclude mark 0x10
+	config_get MARK_MASK ecm_exclude mark_mask 0x10
+
+	probe_ecm_classifier
+
+	rm -f "$ECM_NFT_FILE"
+
+	# 在 PREROUTING(mangle) 尽早打标（ECM 在连接首包阶段采集 mark），
+	# 同时 forward(filter) 兜底，兼容在转发阶段读取 mark 的实现。
+	cat > "$ECM_NFT_FILE" << EOF
+table inet ecm_auto_exclude {
+	chain prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+EOF
+
+	collect_eqosplus
+	collect_connlimit
+
+	cat >> "$ECM_NFT_FILE" << EOF
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+EOF
+
+	collect_eqosplus
+	collect_connlimit
+
+	echo "	}" >> "$ECM_NFT_FILE"
+	echo "}" >> "$ECM_NFT_FILE"
+}
+
+# ---------- 规则生成辅助 ----------
+
+emit_mark_rule() {
+	local expr="$1"
+	local mask_neg
+	mask_neg=$(printf '0x%x' $(( ~MARK_MASK & 0xffffffff )))
+
+	# fwmark：ECM mark classifier 主要读取 skb mark
+	echo "		$expr meta mark set meta mark and $mask_neg or $MARK" >> "$ECM_NFT_FILE"
+	# ctmark：同步连接标记，兼容读取连接标记的实现
+	echo "		$expr ct mark set ct mark and $mask_neg or $MARK" >> "$ECM_NFT_FILE"
+}
+
+emit_mac_rule() {
+	emit_mark_rule "ether saddr $1"
+}
+
+emit_ip4_rule() {
+	emit_mark_rule "ip saddr $1"
+}
+
+emit_ip6_rule() {
+	emit_mark_rule "ip6 saddr $1"
+}
+
+# eqosplus：mac 字段语义 = MAC / IPv6 / IPv4 / IPv4-CIDR / IPv4 范围
+eqosplus_device() {
+	local enable=0 mac=""
+	config_get_bool enable "$1" enable 0
+	[ "$enable" = "1" ] || return 0
+	config_get mac "$1" mac
+	[ -n "$mac" ] || return 0
+
+	case "$mac" in
+		*:*:*:*:*:*) emit_mac_rule "$mac" ;;
+		*:*)          emit_ip6_rule "$mac" ;;
+		*/*)          emit_ip4_rule "$mac" ;;
+		*-*)          emit_ip4_rule "$mac" ;;
+		*.*)          emit_ip4_rule "$mac" ;;
+	esac
+}
+
+check_eqosplus_global() {
+	config_get_bool EQOSPLUS_ENABLED "$1" enabled 0
+}
+
+collect_eqosplus() {
+	EQOSPLUS_ENABLED=0
+	config_load eqosplus
+	config_foreach check_eqosplus_global eqosplus
+	[ "$EQOSPLUS_ENABLED" = "1" ] || return 0
+	config_foreach eqosplus_device device
+}
+
+# connlimit：config device 段（MAC > IPv6 > IPv4）
+connlimit_device() {
+	local dev_enabled=1 ip ip6 mac
+	config_get_bool dev_enabled "$1" enabled 1
+	[ "$dev_enabled" = "1" ] || return 0
+	config_get mac "$1" mac
+	config_get ip6 "$1" ip6
+	config_get ip "$1" ip
+
+	if [ -n "$mac" ]; then
+		emit_mac_rule "$mac"
+	elif [ -n "$ip6" ]; then
+		emit_ip6_rule "$ip6"
+	elif [ -n "$ip" ]; then
+		emit_ip4_rule "$ip"
+	fi
+}
+
+check_connlimit_global() {
+	config_get_bool CONNLIMIT_ENABLED "$1" enabled 0
+}
+
+collect_connlimit() {
+	CONNLIMIT_ENABLED=0
+	config_load connlimit
+	config_foreach check_connlimit_global limit
+	[ "$CONNLIMIT_ENABLED" = "1" ] || return 0
+	config_foreach connlimit_device device
+}
